@@ -85,6 +85,8 @@ def eval_on_stream(
     hook_name: str,
     num_batches: int,
     active_threshold: float,
+    theta: Optional[float] = None,
+    theta_eps: float = 1e-12,
 ) -> Dict[str, float]:
     """Evaluate reconstruction + sparsity on a small stream of activations.
 
@@ -143,15 +145,34 @@ def eval_on_stream(
             n_total = new_total
 
         out = sae(x)
-        x_hat = out.x_hat
-        a = out.a
+        a = out.a  # [N, K]
 
-        # recon mse numerator
+        if theta is not None:
+            # BatchTopK inference-style gating (batch-independent)
+            mask = (a > (float(theta) - theta_eps))
+            a_used = a * mask.to(dtype=a.dtype)
+            x_hat = sae.decode(a_used)
+
+            # For L0 / dead / rare, count actives under theta gating
+            active = mask.float()
+        else:
+            # Default behavior (L1-trained SAEs etc.)
+            x_hat = out.x_hat
+            active = (a > active_threshold).float()
+
+        # recon mse numerator (use x_hat that matches gating choice)
         sq_err = torch.mean((x - x_hat) ** 2).item()
         sum_sq_err += sq_err * N  # weight by N
 
         # L0
-        active = (a > active_threshold).float()
+        sum_active += active.sum().item()
+
+        # per-feature activity (dead/rare)
+        if feat_active_counts is None:
+            feat_active_counts = active.sum(dim=0).cpu()
+        else:
+            feat_active_counts += active.sum(dim=0).cpu()
+
         sum_active += active.sum().item()  # counts all actives over [N, K]
 
         # per-feature activity (dead/rare)
@@ -198,7 +219,12 @@ def eval_on_stream(
     dead_frac = float((p < 1e-6).mean())
     rare_frac = float((p < 1e-4).mean())
 
+    theta_out = {}
+    if theta is not None:
+        theta_out["bt_theta"] = float(theta)
+
     return {
+        **theta_out,
         "recon_mse": float(recon_mse),
         "baseline_mse": float(baseline_mse),
         "fvu": float(fvu),
@@ -264,7 +290,14 @@ def calibrate_lambda_for_target_l0(
 # -------------------------
 
 @torch.no_grad()
-def run_quick_eval(cfg: Config, sae, *, model=None, hook_name: Optional[str] = None) -> Dict[str, float]:
+def run_quick_eval(
+    cfg: Config,
+    sae,
+    *,
+    model=None,
+    hook_name: Optional[str] = None,
+    theta: Optional[float] = None,
+) -> Dict[str, float]:
     """Paper-aligned quick eval.
 
     Computes:
@@ -281,7 +314,10 @@ def run_quick_eval(cfg: Config, sae, *, model=None, hook_name: Optional[str] = N
                 cfg, sae, model=model, hook_name=hook_name,
                 num_batches=cfg.eval_num_batches,
                 active_threshold=cfg.active_threshold,
+                theta=theta,
+                theta_eps=getattr(cfg, "btq_eps", 1e-12),
             )
         )
+
 
     return out

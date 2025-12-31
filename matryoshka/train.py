@@ -14,6 +14,7 @@ from typing import Dict
 import torch
 from tqdm import tqdm
 
+from calibration import calibrate_theta_for_target_l0, estimate_l0_with_theta
 from stoch_avail import StochasticAvailability
 from config import Config, make_run_dir, save_config
 from data import TokenBatcher
@@ -253,7 +254,40 @@ def train(cfg: Config) -> Path:
 
     # quick eval snapshot at end
     sae.eval()
-    eval_out = run_quick_eval(cfg, sae, model=model, hook_name=hook_name)
+
+    # --- BatchTopK inference calibration (global theta) ---
+    theta = None
+    theta_stats: Dict[str, float] = {}
+    if cfg.sparsity == "batchtopk":
+        assert cfg.target_l0 is not None
+        theta, theta_stats = calibrate_theta_for_target_l0(
+            cfg, sae,
+            model=model,
+            hook_name=hook_name,
+            target_l0=float(cfg.target_l0),
+            num_batches=getattr(cfg, "calib_batches", 10),
+            samples_per_batch=200_000,
+            eps=getattr(cfg, "btq_eps", 1e-12),
+        )
+        theta_stats.update(
+            estimate_l0_with_theta(
+                cfg, sae,
+                model=model,
+                hook_name=hook_name,
+                theta=float(theta),
+                num_batches=5,
+                eps=getattr(cfg, "btq_eps", 1e-12),
+            )
+        )
+        (run_dir / "batchtopk_theta.json").write_text(
+            json.dumps({"theta": theta, **theta_stats}, indent=2, sort_keys=True)
+        )
+        mlflow_log_artifact(cfg, str(run_dir / "batchtopk_theta.json"))
+
+    eval_out = run_quick_eval(cfg, sae, model=model, hook_name=hook_name, theta=theta)
+    if theta_stats:
+        eval_out.update(theta_stats)
+
     (run_dir / "eval.json").write_text(json.dumps(eval_out, indent=2, sort_keys=True))
     mlflow_log_metrics(cfg, {f"eval_{k}": float(v) for k, v in eval_out.items()}, step=cfg.num_steps)
     mlflow_log_artifact(cfg, str(run_dir / "eval.json"))
