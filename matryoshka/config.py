@@ -41,23 +41,6 @@ class Config:
     """
 
     # ============================================================
-    # HuggingFace dataset options
-    # ============================================================
-    
-    # Name of the text field inside each dataset example
-    # Most datasets use "text", but some use "content", "body", etc.
-    hf_text_field: str = "text"
-
-    # Data / token stream
-    local_text_path: Optional[str] = None
-
-    # Default to a small, stable dataset so train.py works out of the box
-    hf_dataset: Optional[str] = "wikitext"
-    hf_dataset_config: Optional[str] = "wikitext-2-raw-v1"
-    hf_split: str = "train"
-    hf_text_field: str = "text"
-
-    # ============================================================
     # Run bookkeeping / reproducibility
     # ============================================================
 
@@ -106,18 +89,19 @@ class Config:
     # ============================================================
     # Data / token stream
     # ============================================================
+    # Name of the text field inside each dataset example
+    # Most datasets use "text", but some use "content", "body", etc.
+    hf_text_field: str = "text"
 
-    # Path to a local text file used as training data.
-    # If set, HF datasets are ignored.
+    # Data / token stream
     local_text_path: Optional[str] = None
 
-    # HuggingFace dataset name (e.g. "allenai/c4", "wikitext")
-    # Used only if local_text_path is None.
-    hf_dataset: Optional[str] = None
-
-    # Dataset split to use (usually "train")
+    # Default to a small, stable dataset so train.py works out of the box
+    hf_dataset: Optional[str] = "wikitext"
+    hf_dataset_config: Optional[str] = "wikitext-2-raw-v1"
     hf_split: str = "train"
-
+    hf_text_field: str = "text"
+    
     # Sequence length for each tokenized example
     seq_len: int = 256
 

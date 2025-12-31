@@ -20,6 +20,7 @@ from data import TokenBatcher
 from tl_activations import pick_device, pick_dtype, load_tl_model, get_activations, flatten_activations
 from sae import SparseAutoencoder, recon_loss
 from sparsity import UniformL1Penalty, FrequencyWeightedL1Penalty
+from batchtopk import apply_batchtopk
 from eval_metrics import run_quick_eval
 from mlflow_utils import maybe_init_mlflow, mlflow_log_metrics, mlflow_log_artifact
 
@@ -32,8 +33,7 @@ def set_seed(seed: int) -> None:
 
 def _make_penalty(cfg: Config, device: torch.device):
     """Return a sparsity penalty module for L1-based modes.
-
-    NOTE: BatchTopK is not implemented yet in commit 2.
+    For BatchTopK, sparsity is enforced by gating (no penalty loss), so return None.
     """
     if cfg.sparsity == "l1_uniform":
         return UniformL1Penalty(lambda_base=cfg.lambda_base)
@@ -53,7 +53,7 @@ def _make_penalty(cfg: Config, device: torch.device):
         )
 
     if cfg.sparsity == "batchtopk":
-        raise ValueError("sparsity='batchtopk' not implemented yet (next commit).")
+        return None
 
     raise ValueError(f"Unknown sparsity: {cfg.sparsity}")
 
@@ -66,7 +66,9 @@ def train(cfg: Config) -> Path:
     dtype = pick_dtype(cfg.dtype, device)
     set_seed(cfg.seed)
 
-    # Guard rails for unimplemented modes (commit 2)
+    if cfg.sparsity == "batchtopk" and cfg.target_l0 is None:
+        raise ValueError("sparsity='batchtopk' requires --target_l0 (e.g. --target_l0 40).")
+
     if cfg.recon_variant == "matryoshka":
         raise ValueError("recon_variant='matryoshka' not implemented yet (later commit).")
 
@@ -134,27 +136,54 @@ def train(cfg: Config) -> Path:
             x = flatten_activations(acts).to(torch.float32)
 
         out = sae(x)
-        a = out.a
+        a = out.a  # [N, K]
 
-        # --- Recon path depends on recon_variant ---
+        # -------------------------
+        # Apply sparsity mechanism to produce activations used for decoding
+        # -------------------------
+        bt_stats: Dict[str, float] = {}
+        if cfg.sparsity == "batchtopk":
+            # Gate *before* any recon-variant masking (availability), since BatchTopK is the primary sparsity.
+            a_used, bt_stats = apply_batchtopk(
+                a,
+                k_per_row=float(cfg.target_l0),   # type: ignore[arg-type]
+                tie_break=getattr(cfg, "btq_tie_break", "none"),
+                eps=getattr(cfg, "btq_eps", 1e-12),
+            )
+        else:
+            a_used = a
+
+        # -------------------------
+        # Recon path depends on recon_variant
+        # -------------------------
         sa_stats: Dict[str, float] = {}
         if cfg.recon_variant == "stoch_avail":
             assert stoch_avail is not None
-            a_masked, sa_stats = stoch_avail.mask(a)
+            # availability masking only affects reconstruction path
+            a_masked, sa_stats = stoch_avail.mask(a_used)
             x_hat = sae.decode(a_masked)
         elif cfg.recon_variant == "standard":
-            x_hat = out.x_hat
+            # decode from the activations used (batchtopk-gated if enabled)
+            x_hat = sae.decode(a_used) if cfg.sparsity == "batchtopk" else out.x_hat
         else:
             raise ValueError(f"Unknown recon_variant: {cfg.recon_variant}")
 
         l_recon = recon_loss(x, x_hat, cfg.recon_loss)
 
-        # --- Sparsity loss depends on sparsity ---
-        # For stoch_avail, apply sparsity to the *true* a (unmasked),
-        # as you already did previously.
-        l_sparse, sparse_stats = penalty.compute(a, step=step)
+        # -------------------------
+        # Sparsity loss term (L1 modes only)
+        # -------------------------
+        if cfg.sparsity == "batchtopk":
+            l_sparse = torch.zeros((), device=x.device, dtype=torch.float32)
+            sparse_stats: Dict[str, float] = {"lambda_mean": 0.0}
+        else:
+            assert penalty is not None
+            # For stoch_avail, apply L1 sparsity to the *true* a (ungated/unmasked),
+            # matching your earlier behavior.
+            l_sparse, sparse_stats = penalty.compute(a, step=step)
 
         loss = l_recon + l_sparse
+
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -175,6 +204,8 @@ def train(cfg: Config) -> Path:
                 tok_s=f"{tok_per_s:.0f}",
             )
             lam_mean = sparse_stats.get("lambda_mean")
+            if "bt_l0_mean" in bt_stats:
+                postfix["bt_l0"] = f"{bt_stats['bt_l0_mean']:.1f}"
             if lam_mean is not None:
                 postfix["lam"] = f"{lam_mean:.2e}"
             if "sa_mask_mean" in sa_stats:
@@ -191,6 +222,7 @@ def train(cfg: Config) -> Path:
                 "recon": float(l_recon.item()),
                 "sparse": float(l_sparse.item()),
             }
+            row.update({k: float(v) for k, v in bt_stats.items()})
             row.update({k: float(v) for k, v in sparse_stats.items()})
             row.update({k: float(v) for k, v in sa_stats.items()})
 
