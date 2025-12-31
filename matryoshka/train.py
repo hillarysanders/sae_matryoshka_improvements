@@ -2,17 +2,17 @@
 from __future__ import annotations
 
 import json
-import math
 import random
 import os
+import time
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 from pathlib import Path
 from typing import Dict
 
 import torch
 from tqdm import tqdm
-import time
 
 from stoch_avail import StochasticAvailability
 from config import Config, make_run_dir, save_config
@@ -31,9 +31,14 @@ def set_seed(seed: int) -> None:
 
 
 def _make_penalty(cfg: Config, device: torch.device):
-    if cfg.method == "baseline_l1":
+    """Return a sparsity penalty module for L1-based modes.
+
+    NOTE: BatchTopK is not implemented yet in commit 2.
+    """
+    if cfg.sparsity == "l1_uniform":
         return UniformL1Penalty(lambda_base=cfg.lambda_base)
-    if cfg.method == "freq_weighted_l1":
+
+    if cfg.sparsity == "l1_freq_weighted":
         return FrequencyWeightedL1Penalty(
             n_latents=cfg.n_latents,
             lambda_base=cfg.lambda_base,
@@ -46,10 +51,11 @@ def _make_penalty(cfg: Config, device: torch.device):
             normalize_mean=cfg.fw_normalize_mean,
             device=device,
         )
-    if cfg.method == "stoch_avail_l1":
-        return UniformL1Penalty(lambda_base=cfg.lambda_base)
-    
-    raise ValueError(f"Unknown method: {cfg.method}")
+
+    if cfg.sparsity == "batchtopk":
+        raise ValueError("sparsity='batchtopk' not implemented yet (next commit).")
+
+    raise ValueError(f"Unknown sparsity: {cfg.sparsity}")
 
 
 def train(cfg: Config) -> Path:
@@ -59,6 +65,10 @@ def train(cfg: Config) -> Path:
     device = pick_device(cfg.device)
     dtype = pick_dtype(cfg.dtype, device)
     set_seed(cfg.seed)
+
+    # Guard rails for unimplemented modes (commit 2)
+    if cfg.recon_variant == "matryoshka":
+        raise ValueError("recon_variant='matryoshka' not implemented yet (later commit).")
 
     model = load_tl_model(cfg.model_name, device=device, dtype=dtype)
     hook_name = cfg.resolved_hook()
@@ -74,15 +84,14 @@ def train(cfg: Config) -> Path:
         tied_weights=cfg.tied_weights,
         activation=cfg.activation,
         device=device,
-        dtype=torch.float32,  # keep SAE in fp32 by default for stability
+        dtype=torch.float32,  # keep SAE in fp32 for stability
     )
 
     penalty = _make_penalty(cfg, device=device)
-
     opt = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     metrics_path = run_dir / "metrics.jsonl"
-    f_metrics = metrics_path.open("w")
+    f_metrics = metrics_path.open("w", encoding="utf-8")
 
     mlflow_run = maybe_init_mlflow(cfg)
     mlflow_log_artifact(cfg, str(run_dir / "config.json"))
@@ -101,7 +110,7 @@ def train(cfg: Config) -> Path:
     it = iter(batcher)
 
     stoch_avail = None
-    if cfg.method == "stoch_avail_l1":
+    if cfg.recon_variant == "stoch_avail":
         stoch_avail = StochasticAvailability(
             n_latents=cfg.n_latents,
             p_min=cfg.sa_p_min,
@@ -112,7 +121,6 @@ def train(cfg: Config) -> Path:
         )
 
     sae.train()
-
     pbar = tqdm(total=cfg.num_steps, desc="train", dynamic_ncols=True)
     t0 = time.time()
     tokens_seen = 0
@@ -128,16 +136,23 @@ def train(cfg: Config) -> Path:
         out = sae(x)
         a = out.a
 
-        if cfg.method == "stoch_avail_l1":
+        # --- Recon path depends on recon_variant ---
+        sa_stats: Dict[str, float] = {}
+        if cfg.recon_variant == "stoch_avail":
             assert stoch_avail is not None
             a_masked, sa_stats = stoch_avail.mask(a)
             x_hat = sae.decode(a_masked)
-        else:
+        elif cfg.recon_variant == "standard":
             x_hat = out.x_hat
-            sa_stats = {}
-            
+        else:
+            raise ValueError(f"Unknown recon_variant: {cfg.recon_variant}")
+
         l_recon = recon_loss(x, x_hat, cfg.recon_loss)
-        l_sparse, sparse_stats = penalty.compute(a, step=step)  # sparsity on true a
+
+        # --- Sparsity loss depends on sparsity ---
+        # For stoch_avail, apply sparsity to the *true* a (unmasked),
+        # as you already did previously.
+        l_sparse, sparse_stats = penalty.compute(a, step=step)
 
         loss = l_recon + l_sparse
 
@@ -165,10 +180,10 @@ def train(cfg: Config) -> Path:
             if "sa_mask_mean" in sa_stats:
                 postfix["mask"] = f"{sa_stats['sa_mask_mean']:.2f}"
             pbar.set_postfix(**postfix)
-            
+
         pbar.update(1)
 
-        # ---- existing logging ----
+        # ---- logging ----
         if step % cfg.log_every == 0 or step == 1:
             row: Dict[str, float] = {
                 "step": float(step),
@@ -177,7 +192,7 @@ def train(cfg: Config) -> Path:
                 "sparse": float(l_sparse.item()),
             }
             row.update({k: float(v) for k, v in sparse_stats.items()})
-            row.update(sa_stats)
+            row.update({k: float(v) for k, v in sa_stats.items()})
 
             f_metrics.write(json.dumps(row) + "\n")
             f_metrics.flush()
@@ -188,6 +203,7 @@ def train(cfg: Config) -> Path:
                 f"[{step:>6d}] loss={row['loss']:.4e} recon={row['recon']:.4e} sparse={row['sparse']:.4e} "
                 f"lam_mean={row.get('lambda_mean', float('nan')):.3e}"
             )
+
         if step % cfg.ckpt_every == 0 or step == cfg.num_steps:
             ckpt_path = run_dir / f"sae_step_{step}.pt"
             torch.save(
@@ -199,13 +215,12 @@ def train(cfg: Config) -> Path:
                 ckpt_path,
             )
             mlflow_log_artifact(cfg, str(ckpt_path))
-    pbar.close()
 
+    pbar.close()
     f_metrics.close()
 
     # quick eval snapshot at end
     sae.eval()
-    # eval_out = run_quick_eval(cfg, sae)
     eval_out = run_quick_eval(cfg, sae, model=model, hook_name=hook_name)
     (run_dir / "eval.json").write_text(json.dumps(eval_out, indent=2, sort_keys=True))
     mlflow_log_metrics(cfg, {f"eval_{k}": float(v) for k, v in eval_out.items()}, step=cfg.num_steps)

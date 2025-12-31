@@ -5,8 +5,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 import json
 import time
-from typing import Literal, Optional
-
+from typing import Literal, Optional, List
 
 # -----------------------------
 # Type aliases for clarity
@@ -18,7 +17,10 @@ DType = Literal["auto", "fp32", "fp16", "bf16"]
 # Which sparsity objective to use:
 # - "baseline_l1": standard SAE with uniform L1 sparsity penalty
 # - "freq_weighted_l1": frequency-weighted (TF-IDF-style) sparsity penalty (this project)
-Method = Literal["baseline_l1", "freq_weighted_l1", "stoch_avail_l1"]
+# config.py
+
+ReconVariant = Literal["standard", "matryoshka", "stoch_avail"]
+Sparsity = Literal["l1_uniform", "l1_freq_weighted", "batchtopk"]
 
 
 
@@ -34,8 +36,8 @@ class Config:
       - which sparsity objective is applied
       - what evaluation metrics are computed
 
-    The key experimental switch is `method`, which selects between the
-    standard SAE objective and the frequency-weighted sparsity objective.
+    The key experimental switches are `recon_variant` and `sparsity, which selects between the
+    different approaches, e.g. standard SAE objective and the frequency-weighted sparsity objective.
     """
 
     # ============================================================
@@ -170,8 +172,10 @@ class Config:
     #     its own lambda_i ~ 1 / (p_i + eps)^alpha, with p_i estimated
     #     from historical activation frequency.
     #
-    method: Method = "baseline_l1"
-
+    recon_variant: ReconVariant = "standard"
+    sparsity: Sparsity = "l1_uniform"
+    
+    
     # Base sparsity coefficient.
     # For baseline_l1: lambda
     # For freq_weighted_l1: mean(lambda_i)
@@ -219,10 +223,18 @@ class Config:
     redundancy_high_sim: float = 0.95
     
 
-    target_l0: Optional[float] = None # (e.g. 40.0)
+    # Used when sparsity == "batchtopk"
+    target_l0: Optional[float] = None   # for batchtopk
+    btq_eps: float = 1e-12              # numerical guard for thresholds
+    btq_tie_break: Literal["none","random"] = "none"  # optional
+    
+    # Used when recon_variant == "matryoshka"
+    matryoshka_ms: List[int] = field(default_factory=lambda: [])  # if empty, auto-fill from n_latents
+    matryoshka_recon_agg: Literal["mean","sum"] = "mean"
+    matryoshka_include_full: bool = True  # whether to always include m = n_latents (usually yes)
 
+    # calibration
     calibrate_l0: bool = False # (whether to run calibration)
-
     calib_rounds: int = 8
     calib_batches: int = 5
     calib_tol: float = 1.0
@@ -252,7 +264,24 @@ class Config:
         """Return the concrete hook name for the selected layer."""
         return self.hook_point.format(layer=self.layer)
 
+    # def resolve_modes(self: Config) -> Config:
+    #     """
+    #     Back-compat mapping if cfg.method is set.
+    #     Returns cfg with recon_variant/sparsity filled.
+    #     """
+    #     if self.method is None:
+    #         return self
 
+    #     mapping = {
+    #         "baseline_l1": ("standard", "l1_uniform"),
+    #         "freq_weighted_l1": ("standard", "l1_freq_weighted"),
+    #         "stoch_avail_l1": ("stoch_avail", "l1_uniform"),
+    #     }
+    #     rv, sp = mapping[self.method]
+    #     self.recon_variant = rv
+    #     self.sparsity = sp
+    #     return self
+    
 # ------------------------------------------------------------
 # Run directory + config persistence helpers
 # ------------------------------------------------------------
@@ -271,3 +300,6 @@ def save_config(cfg: Config, run_dir: Path) -> None:
     path = run_dir / "config.json"
     with path.open("w") as f:
         json.dump(asdict(cfg), f, indent=2, sort_keys=True)
+
+
+
