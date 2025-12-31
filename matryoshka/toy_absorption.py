@@ -113,6 +113,44 @@ def make_penalty(cfg: Config, device: torch.device):
 
 
 # ----------------------------
+# Matryoshka helpers (fixed-prefix)
+# ----------------------------
+
+def _default_matryoshka_ms(n_latents: int) -> list[int]:
+    """Reasonable default prefix ladder (small -> larger -> full)."""
+    ladder: list[int] = []
+    for frac in (1 / 32, 1 / 16, 1 / 8, 1 / 4):
+        m = int(round(n_latents * frac))
+        ladder.append(max(8, min(m, n_latents)))
+    ladder = sorted(set(ladder))
+    if not ladder or ladder[-1] != n_latents:
+        ladder.append(n_latents)
+    return ladder
+
+
+def _resolve_matryoshka_ms(cfg: Config) -> list[int]:
+    ms = list(getattr(cfg, "matryoshka_ms", []) or [])
+    if not ms:
+        ms = _default_matryoshka_ms(cfg.n_latents)
+
+    ms = sorted(set(int(m) for m in ms))
+    ms = [m for m in ms if 1 <= m <= cfg.n_latents]
+
+    if getattr(cfg, "matryoshka_include_full", True):
+        if (not ms) or (ms[-1] != cfg.n_latents):
+            ms.append(cfg.n_latents)
+
+    if not ms:
+        raise ValueError("matryoshka_ms resolved to empty; check config.")
+    return ms
+
+
+def _decode_prefix(sae: SparseAutoencoder, a_used: torch.Tensor, m: int) -> torch.Tensor:
+    """Decode using only the first m latents (fixed-prefix Matryoshka)."""
+    return a_used[:, :m] @ sae.W_dec[:m] + sae.b_dec
+
+
+# ----------------------------
 # Metrics
 # ----------------------------
 
@@ -198,9 +236,6 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
     torch.manual_seed(spec.seed)
     random.seed(spec.seed)
 
-    if cfg.recon_variant == "matryoshka":
-        raise ValueError("toy: recon_variant='matryoshka' not implemented yet (later commit).")
-
     U = make_orthonormal_features(spec.d_model, 1 + spec.n_children, device=device)
 
     sae = SparseAutoencoder(
@@ -241,13 +276,32 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
             assert stoch is not None
             a_m, sa_stats = stoch.mask(a)
             x_hat = sae.decode(a_m)
+            l_recon = torch.mean((x - x_hat) ** 2)
+
         elif cfg.recon_variant == "standard":
             x_hat = out.x_hat
             sa_stats = {}
+            l_recon = torch.mean((x - x_hat) ** 2)
+
+        elif cfg.recon_variant == "matryoshka":
+            ms = _resolve_matryoshka_ms(cfg)
+            recon_terms = []
+            for m in ms:
+                x_hat_m = _decode_prefix(sae, a, m)
+                recon_terms.append(torch.mean((x - x_hat_m) ** 2))
+
+            if getattr(cfg, "matryoshka_recon_agg", "mean") == "sum":
+                l_recon = torch.stack(recon_terms).sum()
+            else:
+                l_recon = torch.stack(recon_terms).mean()
+
+            # For logging/postfix only
+            x_hat = _decode_prefix(sae, a, ms[-1])
+            sa_stats = {}
+
         else:
             raise ValueError(cfg.recon_variant)
 
-        l_recon = torch.mean((x - x_hat) ** 2)
         l_sparse, sparse_stats = penalty.compute(a, step=step + 1)
         loss = l_recon + l_sparse
 
@@ -269,7 +323,12 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
     x_eval, child_idx = sample_tree_batch(U, spec, n=spec.n_eval, device=device)
     out = sae(x_eval)
     a_eval = out.a
-    x_hat = out.x_hat
+
+    if cfg.recon_variant == "matryoshka":
+        ms = _resolve_matryoshka_ms(cfg)
+        x_hat = _decode_prefix(sae, a_eval, ms[-1])
+    else:
+        x_hat = out.x_hat
 
     parent_lat, child_lats = match_latents_to_truth(sae, U)
     abs_rate = absorption_rate_simple(
@@ -314,6 +373,10 @@ def main() -> None:
     run_one("standard_l1_uniform", "standard", "l1_uniform")
     run_one("standard_l1_freq_weighted", "standard", "l1_freq_weighted")
     run_one("stoch_avail_l1_uniform", "stoch_avail", "l1_uniform")
+
+    # New: Matryoshka toy runs
+    run_one("matryoshka_l1_uniform", "matryoshka", "l1_uniform")
+    run_one("matryoshka_l1_freq_weighted", "matryoshka", "l1_freq_weighted")
 
     out_path = Path(cfg.out_dir) / f"toy_absorption_{cfg.run_name}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
