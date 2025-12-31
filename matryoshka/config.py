@@ -43,13 +43,18 @@ class Config:
     # ============================================================
     # HuggingFace dataset options
     # ============================================================
-
-    # Optional dataset configuration name (required for datasets like wikitext)
-    # Example: "wikitext-2-raw-v1"
-    hf_dataset_config: Optional[str] = None
-
+    
     # Name of the text field inside each dataset example
     # Most datasets use "text", but some use "content", "body", etc.
+    hf_text_field: str = "text"
+
+    # Data / token stream
+    local_text_path: Optional[str] = None
+
+    # Default to a small, stable dataset so train.py works out of the box
+    hf_dataset: Optional[str] = "wikitext"
+    hf_dataset_config: Optional[str] = "wikitext-2-raw-v1"
+    hf_split: str = "train"
     hf_text_field: str = "text"
 
     # ============================================================
