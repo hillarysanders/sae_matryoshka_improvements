@@ -224,9 +224,9 @@ class Config:
 
     # calibration
     calibrate_l0: bool = False # (whether to run calibration)
-    calib_rounds: int = 8
-    calib_batches: int = 5
-    calib_tol: float = 1.0
+    calib_rounds: int = 12
+    calib_batches: int = 10
+    calib_tol: float = 0.5
 
 
     # ============================================================

@@ -13,7 +13,8 @@ from typing import Dict
 
 import torch
 from tqdm import tqdm
-
+from dataclasses import replace
+from eval_metrics import calibrate_lambda_for_target_l0
 from calibration import calibrate_theta_for_target_l0, estimate_l0_with_theta
 from stoch_avail import StochasticAvailability
 from config import Config, make_run_dir, save_config
@@ -316,6 +317,22 @@ def train(cfg: Config) -> Path:
 
     # quick eval snapshot at end
     sae.eval()
+
+    if cfg.calibrate_l0 and cfg.target_l0 is not None and cfg.sparsity in ("l1_uniform", "l1_freq_weighted"):
+        new_lam = calibrate_lambda_for_target_l0(
+            cfg, sae,
+            model=model,
+            hook_name=hook_name,
+            target_l0=float(cfg.target_l0),
+            num_batches=cfg.calib_batches,
+            active_threshold=cfg.active_threshold,
+            max_rounds=cfg.calib_rounds,
+            tol=cfg.calib_tol,
+        )
+        # Update cfg + penalty so subsequent eval uses the calibrated lambda
+        cfg = replace(cfg, lambda_base=float(new_lam))
+        if penalty is not None and hasattr(penalty, "lambda_base"):
+            penalty.lambda_base = float(new_lam)
 
     # --- BatchTopK inference calibration (global theta) ---
     theta = None
