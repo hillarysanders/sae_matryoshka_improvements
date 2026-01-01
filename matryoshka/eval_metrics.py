@@ -165,15 +165,7 @@ def eval_on_stream(
         sum_sq_err += sq_err * N  # weight by N
 
         # L0
-        sum_active += active.sum().item()
-
-        # per-feature activity (dead/rare)
-        if feat_active_counts is None:
-            feat_active_counts = active.sum(dim=0).cpu()
-        else:
-            feat_active_counts += active.sum(dim=0).cpu()
-
-        sum_active += active.sum().item()  # counts all actives over [N, K]
+        sum_active += active.sum().item() # counts all actives over [N, K]
 
         # per-feature activity (dead/rare)
         if feat_active_counts is None:

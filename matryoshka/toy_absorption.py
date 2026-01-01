@@ -16,8 +16,8 @@ from config import Config
 from sae import SparseAutoencoder, normalize_decoder_rows
 from sparsity import UniformL1Penalty, FrequencyWeightedL1Penalty
 from stoch_avail import StochasticAvailability
-
-
+from matryoshka_utils import _resolve_matryoshka_ms, _decode_prefix
+from eval_metrics import avg_max_decoder_cosine_similarity
 # ----------------------------
 # Toy data: parent + children
 # ----------------------------
@@ -53,6 +53,8 @@ def make_orthonormal_features(
     Note: `generator` is optional. In most runs we simply control global seeding.
     This argument exists so you can fully decouple RNG streams if desired.
     """
+    assert n_feats <= d_model
+
     X = torch.randn(n_feats, d_model, device=device, generator=generator)
     Q, _ = torch.linalg.qr(X.t(), mode="reduced")  # [d, n_feats]
     return Q.t().contiguous()  # [n_feats, d]
@@ -124,44 +126,6 @@ def make_penalty(cfg: Config, device: torch.device):
 
 
 # ----------------------------
-# Matryoshka helpers (fixed-prefix)
-# ----------------------------
-
-def _default_matryoshka_ms(n_latents: int) -> list[int]:
-    """Reasonable default prefix ladder (small -> larger -> full)."""
-    ladder: list[int] = []
-    for frac in (1 / 32, 1 / 16, 1 / 8, 1 / 4):
-        m = int(round(n_latents * frac))
-        ladder.append(max(8, min(m, n_latents)))
-    ladder = sorted(set(ladder))
-    if not ladder or ladder[-1] != n_latents:
-        ladder.append(n_latents)
-    return ladder
-
-
-def _resolve_matryoshka_ms(cfg: Config) -> list[int]:
-    ms = list(getattr(cfg, "matryoshka_ms", []) or [])
-    if not ms:
-        ms = _default_matryoshka_ms(cfg.n_latents)
-
-    ms = sorted(set(int(m) for m in ms))
-    ms = [m for m in ms if 1 <= m <= cfg.n_latents]
-
-    if getattr(cfg, "matryoshka_include_full", True):
-        if (not ms) or (ms[-1] != cfg.n_latents):
-            ms.append(cfg.n_latents)
-
-    if not ms:
-        raise ValueError("matryoshka_ms resolved to empty; check config.")
-    return ms
-
-
-def _decode_prefix(sae: SparseAutoencoder, a_used: torch.Tensor, m: int) -> torch.Tensor:
-    """Decode using only the first m latents (fixed-prefix Matryoshka)."""
-    return a_used[:, :m] @ sae.W_dec[:m] + sae.b_dec
-
-
-# ----------------------------
 # Metrics
 # ----------------------------
 
@@ -186,21 +150,21 @@ def latent_active_freq(a: torch.Tensor, thresh: float = 0.0) -> torch.Tensor:
     return (a > thresh).float().mean(dim=0).to(torch.float32)
 
 
-@torch.no_grad()
-def avg_max_decoder_cos(W_dec: torch.Tensor, chunk: int = 2048) -> float:
-    W = normalize_decoder_rows(W_dec).to(torch.float32)
-    K = W.shape[0]
-    if K < 2:
-        return 0.0
-    WT = W.t().contiguous()
-    max_per = torch.full((K,), -1.0, device=W.device)
-    for i0 in range(0, K, chunk):
-        i1 = min(K, i0 + chunk)
-        sims = W[i0:i1] @ WT
-        rows = torch.arange(i0, i1, device=W.device)
-        sims[torch.arange(i1 - i0, device=W.device), rows] = -1e9
-        max_per[i0:i1] = sims.max(dim=1).values
-    return float(max_per.clamp(-1, 1).mean().item())
+# @torch.no_grad()
+# def avg_max_decoder_cos(W_dec: torch.Tensor, chunk: int = 2048) -> float:
+#     W = normalize_decoder_rows(W_dec).to(torch.float32)
+#     K = W.shape[0]
+#     if K < 2:
+#         return 0.0
+#     WT = W.t().contiguous()
+#     max_per = torch.full((K,), -1.0, device=W.device)
+#     for i0 in range(0, K, chunk):
+#         i1 = min(K, i0 + chunk)
+#         sims = W[i0:i1] @ WT
+#         rows = torch.arange(i0, i1, device=W.device)
+#         sims[torch.arange(i1 - i0, device=W.device), rows] = -1e9
+#         max_per[i0:i1] = sims.max(dim=1).values
+#     return float(max_per.clamp(-1, 1).mean().item())
 
 
 # ----------------------------
@@ -871,7 +835,8 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
         # Core metrics
         "fvu": fvu(x_eval, x_hat),
         "l0_mean": l0_mean(a_eval, thresh=cfg.active_threshold),
-        "avg_max_decoder_cos": avg_max_decoder_cos(sae.W_dec),
+        # "avg_max_decoder_cos": avg_max_decoder_cos(sae.W_dec),
+        "avg_max_decoder_cos": avg_max_decoder_cosine_similarity(sae.W_dec)["avg_max_decoder_cos"],
 
         # Absorption metrics
         "absorption_rate_latent": abs_rate_latent_cos,                  # backward compat (cosine match)

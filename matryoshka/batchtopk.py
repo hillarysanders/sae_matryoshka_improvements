@@ -1,55 +1,57 @@
 # batchtopk.py
 from __future__ import annotations
-
-from typing import Dict, Literal, Tuple
-
+import math
+from typing import Dict, Literal, Tuple, Optional
 import torch
 
 
 TieBreak = Literal["none", "random"]
 
-
-@torch.no_grad()
 def apply_batchtopk(
-    a: torch.Tensor,          # [N, K]
+    a: torch.Tensor,          # [..., K]
     *,
     k_per_row: float,
-    tie_break: TieBreak = "none",
+    tie_break: "TieBreak" = "none",
     eps: float = 1e-12,
+    generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """BatchTopK gating across the whole batch.
+    """BatchTopK gating across the whole batch (supports arbitrary leading dims).
 
-    Keeps the top (N * k_per_row) entries in `a` across all N*K positions.
-    Zeroes out everything else.
+    Interprets the last dimension as K and flattens all leading dims into N "rows".
+    Keeps the top (N * k_per_row) entries in `a` across all N*K positions and zeroes the rest.
 
-    This enforces *average* L0 ≈ k_per_row per row (token), but allows per-row
-    variation depending on where the largest activations are.
+    This enforces *average* L0 ≈ k_per_row per row, but allows per-row variation.
 
     Args:
-        a: nonnegative activations [N, K] (ReLU output).
-        k_per_row: target average number of active latents per row.
+        a: activations with shape [..., K] (often [B, T, K] or [N, K]).
+        k_per_row: target average number of active latents per row (token).
         tie_break:
-            - "none": keep all entries >= threshold (may keep slightly > target due to ties)
+            - "none": keep all entries >= threshold (may keep > target due to ties)
             - "random": break ties at the threshold to hit the target count exactly
-        eps: numerical guard for topk thresholding.
+        eps: numerical guard around comparisons to tau.
+        generator: optional torch.Generator for deterministic tie breaking.
 
     Returns:
         a_sparse: masked activations, same shape as `a`
-        stats: diagnostics (tau, keep_target, keep_actual, l0_mean)
+        stats: diagnostics (tau, keep_target, keep_actual, l0_mean, density)
     """
-    if a.ndim != 2:
-        raise ValueError(f"apply_batchtopk expects a [N,K] tensor, got shape {tuple(a.shape)}")
+    if a.ndim < 1:
+        raise ValueError(f"apply_batchtopk expects at least 1D tensor, got shape {tuple(a.shape)}")
 
-    N, K = a.shape
+    K = int(a.shape[-1])
+    leading_shape = a.shape[:-1]
+    N = math.prod(leading_shape) if len(leading_shape) > 0 else 1
+
     if N == 0 or K == 0:
         return a, {
             "bt_tau": 0.0,
             "bt_keep_target": 0.0,
             "bt_keep_actual": 0.0,
             "bt_l0_mean": 0.0,
+            "bt_density": 0.0,
         }
 
-    # Total number of entries to keep
+    # Total number of entries to keep across ALL N*K positions
     keep_target = int(round(float(N) * float(k_per_row)))
     keep_target = max(0, min(keep_target, N * K))
 
@@ -60,67 +62,66 @@ def apply_batchtopk(
             "bt_keep_target": float(keep_target),
             "bt_keep_actual": 0.0,
             "bt_l0_mean": 0.0,
+            "bt_density": 0.0,
         }
 
     if keep_target == N * K:
-        # keep everything
         return a, {
             "bt_tau": 0.0,
             "bt_keep_target": float(keep_target),
             "bt_keep_actual": float(N * K),
             "bt_l0_mean": float(K),
+            "bt_density": 1.0,
         }
 
     flat = a.reshape(-1)
 
-    # Find the keep_target-th largest value = threshold tau
-    # We can do this by taking topk and looking at the smallest among them.
-    # topk is O(M log keep_target) and OK for now; later we can optimize if needed.
-    topv, _ = torch.topk(flat, k=keep_target, largest=True, sorted=False)
-    tau = topv.min().item()
+    # Threshold tau = keep_target-th largest value.
+    # Prefer kthvalue on -flat (avoids materializing top-k values).
+    try:
+        tau = -torch.kthvalue(-flat, k=keep_target).values  # scalar tensor
+    except RuntimeError:
+        # Fallback if kthvalue isn't supported/fast on a given backend
+        topv, _ = torch.topk(flat, k=keep_target, largest=True, sorted=False)
+        tau = topv.min()
 
-    # Initial mask: keep everything >= tau
-    mask = (a >= (tau - eps))
+    if tie_break == "none":
+        # Keep everything >= tau (allowing slight eps slack)
+        mask_flat = flat >= (tau - eps)
 
-    keep_actual = int(mask.sum().item())
+    elif tie_break == "random":
+        # Keep everything strictly greater than tau, then randomly choose among ties near tau.
+        mask_flat = flat > (tau + eps)
+        keep_gt = int(mask_flat.sum().item())
+        need = keep_target - keep_gt
 
-    if tie_break == "random" and keep_actual != keep_target:
-        # If we kept too many due to ties at tau, randomly drop some of the tau-equal entries.
-        # If we kept too few (rare; eps issues), we can promote a few tau-equal entries.
-        # We only adjust among entries very close to tau.
-        close = (a >= (tau - eps)) & (a <= (tau + eps))
-        close_idx = torch.nonzero(close.reshape(-1), as_tuple=False).squeeze(1)
+        if need > 0:
+            close = (flat >= (tau - eps)) & (flat <= (tau + eps)) & (~mask_flat)
+            close_idx = torch.nonzero(close, as_tuple=False).squeeze(1)
 
-        if close_idx.numel() > 0:
-            mask_flat = mask.reshape(-1)
+            if close_idx.numel() >= need:
+                perm = torch.randperm(close_idx.numel(), device=a.device, generator=generator)
+                chosen = close_idx[perm[:need]]
+                mask_flat[chosen] = True
+            else:
+                # Fallback: include all "close" and if still short, do exact topk mask.
+                mask_flat[close_idx] = True
+                if int(mask_flat.sum().item()) < keep_target:
+                    _, top_idx = torch.topk(flat, k=keep_target, largest=True, sorted=False)
+                    mask_flat = torch.zeros_like(mask_flat, dtype=torch.bool)
+                    mask_flat[top_idx] = True
+    else:
+        raise ValueError(f"Unknown tie_break={tie_break!r}")
 
-            if keep_actual > keep_target:
-                # Need to drop (keep_actual - keep_target) from the close set that are currently kept
-                kept_close = close_idx[mask_flat[close_idx]]
-                drop = keep_actual - keep_target
-                if kept_close.numel() > 0 and drop > 0:
-                    perm = torch.randperm(kept_close.numel(), device=a.device)
-                    to_drop = kept_close[perm[:drop]]
-                    mask_flat[to_drop] = False
-            elif keep_actual < keep_target:
-                # Need to add (keep_target - keep_actual) from the close set that are currently not kept
-                not_kept_close = close_idx[~mask_flat[close_idx]]
-                add = keep_target - keep_actual
-                if not_kept_close.numel() > 0 and add > 0:
-                    perm = torch.randperm(not_kept_close.numel(), device=a.device)
-                    to_add = not_kept_close[perm[:add]]
-                    mask_flat[to_add] = True
-
-            mask = mask_flat.reshape(N, K)
-            keep_actual = int(mask.sum().item())
-
+    keep_actual = int(mask_flat.sum().item())
+    mask = mask_flat.reshape(a.shape)
     a_sparse = a * mask.to(dtype=a.dtype)
 
     stats = {
-        "bt_tau": float(tau),
+        "bt_tau": float(tau.detach().item()),
         "bt_keep_target": float(keep_target),
         "bt_keep_actual": float(keep_actual),
-        "bt_l0_mean": float(keep_actual / float(N)),
-        "bt_density": float(keep_actual / float(N * K)),
+        "bt_l0_mean": float(keep_actual / float(N)),       # avg kept per "row"/token
+        "bt_density": float(keep_actual / float(N * K)),   # fraction kept overall
     }
     return a_sparse, stats

@@ -91,7 +91,6 @@ class Config:
     # ============================================================
     # Name of the text field inside each dataset example
     # Most datasets use "text", but some use "content", "body", etc.
-    hf_text_field: str = "text"
 
     # Data / token stream
     local_text_path: Optional[str] = None
@@ -147,23 +146,44 @@ class Config:
     # How often (in steps) to save checkpoints
     ckpt_every: int = 500
 
-    # ============================================================
-    # Sparsity objective (CORE EXPERIMENT)
-    # ============================================================
-
-    # Selects which sparsity objective is used:
+    # ------------------------------------------------------------
+    # Reconstruction variant
+    # ------------------------------------------------------------
+    # Selects how reconstructions are formed from latent activations.
     #
-    # - "baseline_l1":
-    #     Standard SAE objective with a uniform L1 penalty on all latents.
+    # Available options:
     #
-    # - "freq_weighted_l1":
-    #     Frequency-weighted sparsity penalty where each latent i has
-    #     its own lambda_i ~ 1 / (p_i + eps)^alpha, with p_i estimated
-    #     from historical activation frequency.
+    # - "standard"
+    #     Standard SAE reconstruction: x_hat = W_dec @ z
+    #
+    # - "matryoshka"
+    #     Matryoshka-style reconstruction with hierarchical / nested
+    #     decoder structure (see paper for details).
     #
     recon_variant: ReconVariant = "standard"
+
+    # ------------------------------------------------------------
+    # Sparsity objective
+    # ------------------------------------------------------------
+    # Selects which sparsity penalty is applied to latent activations.
+    #
+    # Available options:
+    #
+    # - "l1_uniform"
+    #     Baseline SAE objective with a uniform L1 penalty on all latents.
+    #
+    # - "l1_freq_weighted"
+    #     Frequency-weighted L1 penalty where each latent i has its own
+    #     lambda_i ~ 1 / (p_i + eps)^alpha, with p_i estimated from
+    #     historical activation frequency.
+    #
+    # - "l1_stochastic_availability"
+    #     Stochastic availability objective: latents are randomly masked
+    #     during training according to learned or fixed availability
+    #     probabilities, encouraging redundancy-aware representations.
+    #
     sparsity: Sparsity = "l1_uniform"
-    
+
     
     # Base sparsity coefficient.
     # For baseline_l1: lambda

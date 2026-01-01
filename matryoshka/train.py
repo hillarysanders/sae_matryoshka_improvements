@@ -25,7 +25,7 @@ from sparsity import UniformL1Penalty, FrequencyWeightedL1Penalty
 from batchtopk import apply_batchtopk
 from eval_metrics import run_quick_eval
 from mlflow_utils import maybe_init_mlflow, mlflow_log_metrics, mlflow_log_artifact
-
+from matryoshka_utils import _resolve_matryoshka_ms, _decode_prefix
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -33,44 +33,44 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _default_matryoshka_ms(n_latents: int) -> list[int]:
-    """
-    Paper uses a small set of increasing prefix sizes up to full D.
-    For generality, pick a geometric-ish ladder that’s stable for small/large K.
-    """
-    # Keep it simple: 4 prefixes + full
-    # Avoid tiny m that makes training too noisy.
-    ladder = []
-    for frac in (1/32, 1/16, 1/8, 1/4):
-        m = int(round(n_latents * frac))
-        ladder.append(max(8, min(m, n_latents)))
-    ladder = sorted(set(ladder))
-    if ladder[-1] != n_latents:
-        ladder.append(n_latents)
-    return ladder
+# def _default_matryoshka_ms(n_latents: int) -> list[int]:
+#     """
+#     Paper uses a small set of increasing prefix sizes up to full D.
+#     For generality, pick a geometric-ish ladder that’s stable for small/large K.
+#     """
+#     # Keep it simple: 4 prefixes + full
+#     # Avoid tiny m that makes training too noisy.
+#     ladder = []
+#     for frac in (1/32, 1/16, 1/8, 1/4):
+#         m = int(round(n_latents * frac))
+#         ladder.append(max(8, min(m, n_latents)))
+#     ladder = sorted(set(ladder))
+#     if ladder[-1] != n_latents:
+#         ladder.append(n_latents)
+#     return ladder
 
 
-def _resolve_matryoshka_ms(cfg: Config) -> list[int]:
-    ms = list(getattr(cfg, "matryoshka_ms", []) or [])
-    if not ms:
-        ms = _default_matryoshka_ms(cfg.n_latents)
+# def _resolve_matryoshka_ms(cfg: Config) -> list[int]:
+#     ms = list(getattr(cfg, "matryoshka_ms", []) or [])
+#     if not ms:
+#         ms = _default_matryoshka_ms(cfg.n_latents)
 
-    # sanitize
-    ms = sorted(set(int(m) for m in ms))
-    ms = [m for m in ms if 1 <= m <= cfg.n_latents]
+#     # sanitize
+#     ms = sorted(set(int(m) for m in ms))
+#     ms = [m for m in ms if 1 <= m <= cfg.n_latents]
 
-    if getattr(cfg, "matryoshka_include_full", True):
-        if (not ms) or (ms[-1] != cfg.n_latents):
-            ms.append(cfg.n_latents)
+#     if getattr(cfg, "matryoshka_include_full", True):
+#         if (not ms) or (ms[-1] != cfg.n_latents):
+#             ms.append(cfg.n_latents)
 
-    if not ms:
-        raise ValueError("matryoshka_ms resolved to empty; check config.")
-    return ms
+#     if not ms:
+#         raise ValueError("matryoshka_ms resolved to empty; check config.")
+#     return ms
 
 
-def _decode_prefix(sae: SparseAutoencoder, a_used: torch.Tensor, m: int) -> torch.Tensor:
-    # a_used: [N, K], use only first m latents and first m decoder rows
-    return a_used[:, :m] @ sae.W_dec[:m] + sae.b_dec
+# def _decode_prefix(sae: SparseAutoencoder, a_used: torch.Tensor, m: int) -> torch.Tensor:
+#     # a_used: [N, K], use only first m latents and first m decoder rows
+#     return a_used[:, :m] @ sae.W_dec[:m] + sae.b_dec
 
 
 def _make_penalty(cfg: Config, device: torch.device):
