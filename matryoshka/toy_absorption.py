@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # toy_absorption.py
 from __future__ import annotations
 
@@ -14,31 +13,13 @@ from tqdm import tqdm
 
 from config import Config
 from sae import SparseAutoencoder, normalize_decoder_rows
-from sparsity import UniformL1Penalty, FrequencyWeightedL1Penalty
-from stoch_avail import StochasticAvailability
+from sparsity import UniformLpPenalty, FrequencyWeightedLpPenalty
 from matryoshka_utils import _resolve_matryoshka_ms, _decode_prefix
 from eval_metrics import avg_max_decoder_cosine_similarity
+
 # ----------------------------
 # Toy data: parent + children
 # ----------------------------
-
-@dataclass
-class ToyTreeSpec:
-    """Simple 2-level tree: one parent feature + C child features.
-
-    Each example contains:
-      - parent always on (amplitude ~1)
-      - with probability child_prob, one random child is on (amplitude ~1)
-      - optionally: a small amount of gaussian noise
-    """
-    d_model: int = 256
-    n_children: int = 8
-    n_train: int = 50_000
-    n_eval: int = 10_000
-    child_prob: float = 0.3
-    noise_std: float = 0.02
-    seed: int = 0
-
 
 @torch.no_grad()
 def make_orthonormal_features(
@@ -60,67 +41,93 @@ def make_orthonormal_features(
     return Q.t().contiguous()  # [n_feats, d]
 
 
-@torch.no_grad()
-def sample_tree_batch(
-    U: torch.Tensor,  # [1 + C, d_model] feature directions
-    spec: ToyTreeSpec,
-    n: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Generate x and binary indicators of which child was active.
 
-    Returns:
-      x: [n, d_model]
-      child_idx: [n] with -1 meaning no child active, else in [0..C-1]
+@dataclass
+class ToyTreeSpec:
+    """Simple 2-level tree: one parent feature + C child features.
+
+    Each example contains:
+      - parent always on (amplitude ~1)
+      - with probability child_prob, one random child is on (amplitude ~1)
+      - optionally: a small amount of gaussian noise
     """
-    parent = U[0]            # [d]
-    children = U[1:]         # [C, d]
+    d_model: int = 256
+    n_children: int = 8
+    n_train: int = 50_000
+    n_eval: int = 10_000
+    child_prob: float = 0.3
+    noise_std: float = 0.02
+    seed: int = 0
+
+# @torch.no_grad()
+# def make_orthonormal_features(d_model: int, n_feats: int, device: torch.device, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+#     X = torch.randn(n_feats, d_model, device=device, generator=generator)
+#     Q, _ = torch.linalg.qr(X.t(), mode="reduced")
+#     return Q.t().contiguous()
+
+@torch.no_grad()
+def sample_tree_batch(U: torch.Tensor, spec: ToyTreeSpec, n: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    parent = U[0]
+    children = U[1:]
     C = children.shape[0]
-
     parent_amp = torch.ones(n, device=device)
-
     has_child = torch.rand(n, device=device) < spec.child_prob
     child_idx = torch.full((n,), -1, device=device, dtype=torch.long)
     if has_child.any():
         child_idx[has_child] = torch.randint(0, C, (int(has_child.sum().item()),), device=device)
-
     child_amp = torch.zeros(n, device=device)
     child_amp[has_child] = 1.0
-
-    x = parent_amp.unsqueeze(1) * parent.unsqueeze(0)  # [n, d]
+    x = parent_amp.unsqueeze(1) * parent.unsqueeze(0)
     if has_child.any():
         x[has_child] += child_amp[has_child].unsqueeze(1) * children[child_idx[has_child]]
-
     if spec.noise_std > 0:
         x = x + spec.noise_std * torch.randn_like(x)
-
     return x.to(torch.float32), child_idx
-
 
 # ----------------------------
 # Penalty selection (toy uses same sparsity knob)
 # ----------------------------
 
-def make_penalty(cfg: Config, device: torch.device):
-    if cfg.sparsity == "l1_uniform":
-        return UniformL1Penalty(lambda_base=cfg.lambda_base)
 
-    if cfg.sparsity == "l1_freq_weighted":
-        return FrequencyWeightedL1Penalty(
+# ----------------------------
+# Penalty selection (Updated)
+# ----------------------------
+
+def make_penalty(cfg: Config, device: torch.device):
+    astart = cfg.anneal_start_step if cfg.anneal_start_step is not None else int(0.2 * cfg.num_steps)
+    aend = cfg.anneal_end_step if cfg.anneal_end_step is not None else int(0.8 * cfg.num_steps)
+
+    if cfg.sparsity in ("l1_uniform", "p_annealing"):
+        return UniformLpPenalty(
+            lambda_base=cfg.lambda_base,
+            p_start=cfg.p_start,
+            p_end=cfg.p_end,
+            anneal_start=astart,
+            anneal_end=aend,
+            eps=cfg.sparsity_eps
+        )
+
+    if cfg.sparsity in ("l1_freq_weighted", "p_annealing_freq"):
+        return FrequencyWeightedLpPenalty(
             n_latents=cfg.n_latents,
             lambda_base=cfg.lambda_base,
             ema_beta=cfg.fw_ema_beta,
-            eps=cfg.fw_eps,
+            fw_eps=cfg.fw_eps,
             alpha=cfg.fw_alpha,
             warmup_steps=cfg.fw_warmup_steps,
             clip_min=cfg.fw_clip_min,
             clip_max=cfg.fw_clip_max,
             normalize_mean=cfg.fw_normalize_mean,
+            p_start=cfg.p_start,
+            p_end=cfg.p_end,
+            anneal_start=astart,
+            anneal_end=aend,
+            sparsity_eps=cfg.sparsity_eps,
             device=device,
         )
 
     if cfg.sparsity == "batchtopk":
-        raise ValueError("toy: sparsity='batchtopk' not implemented yet (later commit).")
+        raise ValueError("toy: sparsity='batchtopk' not implemented yet.")
 
     raise ValueError(f"Unknown sparsity: {cfg.sparsity}")
 
@@ -505,11 +512,6 @@ def _train_one(
     show_progress: bool,
     seed_offset: int = 1,
 ) -> SparseAutoencoder:
-    # Re-seed so lambda sweeps are comparable (same init & data randomness per candidate)
-    #
-    # IMPORTANT: We intentionally add `seed_offset` here to decouple SAE init/data RNG
-    # from the RNG used to generate U in run_toy(). This avoids subtle artifacts where
-    # "latent 0 always wins" due to correlated RNG streams.
     train_seed = int(spec.seed) + int(seed_offset)
     torch.manual_seed(train_seed)
     random.seed(train_seed)
@@ -524,58 +526,28 @@ def _train_one(
     )
 
     penalty = make_penalty(cfg, device=device)
-
-    stoch = None
-    if cfg.recon_variant == "stoch_avail":
-        stoch = StochasticAvailability(
-            n_latents=cfg.n_latents,
-            p_min=cfg.sa_p_min,
-            gamma=cfg.sa_gamma,
-            inverted=cfg.sa_inverted,
-            shared_across_batch=cfg.sa_shared_across_batch,
-            device=device,
-        )
-
     opt = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
     sae.train()
     bs = cfg.batch_size
-
+    
     it = range(steps)
-    pbar = (
-        tqdm(it, desc=f"toy train [{cfg.recon_variant}+{cfg.sparsity}] lam={cfg.lambda_base:.2e}", dynamic_ncols=True)
-        if show_progress else it
-    )
+    pbar = tqdm(it, desc=f"toy train [{cfg.sparsity}]", dynamic_ncols=True) if show_progress else it
 
     for step in pbar:
         x, _ = sample_tree_batch(U, spec, n=bs, device=device)
         out = sae(x)
         a = out.a
 
-        # Recon path
-        if cfg.recon_variant == "stoch_avail":
-            assert stoch is not None
-            a_m, sa_stats = stoch.mask(a)
-            x_hat = sae.decode(a_m)
-            l_recon = torch.mean((x - x_hat) ** 2)
-
-        elif cfg.recon_variant == "standard":
+        if cfg.recon_variant == "standard":
             x_hat = out.x_hat
-            sa_stats = {}
             l_recon = torch.mean((x - x_hat) ** 2)
-
         elif cfg.recon_variant == "matryoshka":
             ms = _resolve_matryoshka_ms(cfg)
             recon_terms = []
             for m in ms:
                 x_hat_m = _decode_prefix(sae, a, m)
                 recon_terms.append(torch.mean((x - x_hat_m) ** 2))
-            if getattr(cfg, "matryoshka_recon_agg", "mean") == "sum":
-                l_recon = torch.stack(recon_terms).sum()
-            else:
-                l_recon = torch.stack(recon_terms).mean()
-            x_hat = _decode_prefix(sae, a, ms[-1])
-            sa_stats = {}
+            l_recon = torch.stack(recon_terms).mean()
         else:
             raise ValueError(cfg.recon_variant)
 
@@ -589,17 +561,11 @@ def _train_one(
         if show_progress and (step % max(1, cfg.log_every) == 0):
             pbar.set_postfix(
                 loss=f"{loss.item():.3e}",
-                recon=f"{l_recon.item():.3e}",
-                sparse=f"{l_sparse.item():.3e}",
                 lam=f"{sparse_stats.get('lambda_mean', cfg.lambda_base):.2e}",
-                mask=f"{sa_stats.get('sa_mask_mean', float('nan')):.2f}" if sa_stats else "",
+                p=f"{sparse_stats.get('p_current', 1.0):.2f}"
             )
-
-    if show_progress:
-        pbar.close()
-
+    
     return sae
-
 
 def _default_lambda_grid(center: float) -> List[float]:
     """
@@ -627,21 +593,29 @@ def _pick_lambda_via_sweep(
     assert cfg.target_l0 is not None
     target = float(cfg.target_l0)
 
-    # Candidates: either provided externally (via config) or a reasonable default grid
+    # Candidates: use config grid or default
     cand: Optional[List[float]] = getattr(cfg, "toy_lambda_grid", None)
     if cand is None:
         cand = _default_lambda_grid(cfg.lambda_base)
 
-    sweep_steps = cfg.num_steps  # match what you actually care about
-    l0_eval_bs = max(512, cfg.batch_size)  # stabilize L0 measurement
+    # IMPORTANT: The sweep must run for the full duration (cfg.num_steps) 
+    # because P-Annealing and Frequency Weighting change dynamics over time.
+    # If we only ran a short sweep, we'd calibrate for p=1.0 (start), not p=0.5 (end).
+    sweep_steps = cfg.num_steps 
+    
+    l0_eval_bs = max(512, cfg.batch_size)
     l0_eval_batches = int(getattr(cfg, "toy_l0_eval_batches", max(10, cfg.calib_batches)))
 
     best_lam = float(cand[0])
     best_err = float("inf")
     best_fvu = float("inf")
 
+    print(f"[toy] Sweeping lambdas {cand} to hit L0={target}...")
+
     for lam in cand:
         cfg_s = replace(cfg, lambda_base=float(lam))
+        
+        # Train full run for this candidate
         sae_s = _train_one(
             cfg_s,
             U=U,
@@ -653,7 +627,6 @@ def _pick_lambda_via_sweep(
         )
 
         with torch.no_grad():
-            # Evaluate L0 on a few fresh batches
             cur_l0 = measure_l0_on_toy(
                 sae_s, U, spec,
                 device=device,
@@ -661,8 +634,8 @@ def _pick_lambda_via_sweep(
                 batch_size=l0_eval_bs,
                 thresh=cfg.active_threshold,
             )
-
-            # Lightweight FVU estimate (tie-break)
+            
+            # Quick FVU check for tie-breaking
             x_tmp, _ = sample_tree_batch(U, spec, n=spec.n_eval, device=device)
             out_tmp = sae_s(x_tmp)
             if cfg_s.recon_variant == "matryoshka":
@@ -673,15 +646,14 @@ def _pick_lambda_via_sweep(
             cur_fvu = fvu(x_tmp, x_hat_tmp)
 
         err = abs(cur_l0 - target)
+        print(f"   lam={lam:.1e} -> L0={cur_l0:.2f} (err={err:.2f})")
 
-        # Choose minimal L0 error; tie-break by lower FVU
         if (err < best_err) or (abs(err - best_err) < 1e-9 and cur_fvu < best_fvu):
             best_err = err
             best_fvu = cur_fvu
             best_lam = float(lam)
 
     return best_lam
-
 
 # ----------------------------
 # Main toy runner
@@ -710,7 +682,7 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
     do_sweep = (
         cfg.calibrate_l0
         and (cfg.target_l0 is not None)
-        and (cfg.sparsity in ("l1_uniform", "l1_freq_weighted"))
+        and (cfg.sparsity in ("l1_uniform", "l1_freq_weighted", "p_annealing", "p_annealing_freq"))
     )
 
     if do_sweep:

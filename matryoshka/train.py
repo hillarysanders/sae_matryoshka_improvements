@@ -16,12 +16,11 @@ from tqdm import tqdm
 from dataclasses import replace
 from eval_metrics import calibrate_lambda_for_target_l0
 from calibration import calibrate_theta_for_target_l0, estimate_l0_with_theta
-from stoch_avail import StochasticAvailability
 from config import Config, make_run_dir, save_config
 from data import TokenBatcher
 from tl_activations import pick_device, pick_dtype, load_tl_model, get_activations, flatten_activations
 from sae import SparseAutoencoder, recon_loss
-from sparsity import UniformL1Penalty, FrequencyWeightedL1Penalty
+from sparsity import UniformLpPenalty, FrequencyWeightedLpPenalty
 from batchtopk import apply_batchtopk
 from eval_metrics import run_quick_eval
 from mlflow_utils import maybe_init_mlflow, mlflow_log_metrics, mlflow_log_artifact
@@ -33,64 +32,46 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-# def _default_matryoshka_ms(n_latents: int) -> list[int]:
-#     """
-#     Paper uses a small set of increasing prefix sizes up to full D.
-#     For generality, pick a geometric-ish ladder that’s stable for small/large K.
-#     """
-#     # Keep it simple: 4 prefixes + full
-#     # Avoid tiny m that makes training too noisy.
-#     ladder = []
-#     for frac in (1/32, 1/16, 1/8, 1/4):
-#         m = int(round(n_latents * frac))
-#         ladder.append(max(8, min(m, n_latents)))
-#     ladder = sorted(set(ladder))
-#     if ladder[-1] != n_latents:
-#         ladder.append(n_latents)
-#     return ladder
-
-
-# def _resolve_matryoshka_ms(cfg: Config) -> list[int]:
-#     ms = list(getattr(cfg, "matryoshka_ms", []) or [])
-#     if not ms:
-#         ms = _default_matryoshka_ms(cfg.n_latents)
-
-#     # sanitize
-#     ms = sorted(set(int(m) for m in ms))
-#     ms = [m for m in ms if 1 <= m <= cfg.n_latents]
-
-#     if getattr(cfg, "matryoshka_include_full", True):
-#         if (not ms) or (ms[-1] != cfg.n_latents):
-#             ms.append(cfg.n_latents)
-
-#     if not ms:
-#         raise ValueError("matryoshka_ms resolved to empty; check config.")
-#     return ms
-
-
-# def _decode_prefix(sae: SparseAutoencoder, a_used: torch.Tensor, m: int) -> torch.Tensor:
-#     # a_used: [N, K], use only first m latents and first m decoder rows
-#     return a_used[:, :m] @ sae.W_dec[:m] + sae.b_dec
-
-
 def _make_penalty(cfg: Config, device: torch.device):
-    """Return a sparsity penalty module for L1-based modes.
-    For BatchTopK, sparsity is enforced by gating (no penalty loss), so return None.
-    """
-    if cfg.sparsity == "l1_uniform":
-        return UniformL1Penalty(lambda_base=cfg.lambda_base)
+    """Return a sparsity penalty module based on config."""
+    
+    # Calculate annealing steps defaults if not provided
+    astart = cfg.anneal_start_step if cfg.anneal_start_step is not None else int(0.2 * cfg.num_steps)
+    aend = cfg.anneal_end_step if cfg.anneal_end_step is not None else int(0.8 * cfg.num_steps)
 
-    if cfg.sparsity == "l1_freq_weighted":
-        return FrequencyWeightedL1Penalty(
+    # 1. Uniform Weighting (Baseline or Pure P-Annealing)
+    if cfg.sparsity in ("l1_uniform", "p_annealing"):
+        return UniformLpPenalty(
+            lambda_base=cfg.lambda_base,
+            p_start=cfg.p_start,
+            p_end=cfg.p_end,
+            anneal_start=astart,
+            anneal_end=aend,
+            eps=cfg.sparsity_eps
+        )
+
+    # 2. Frequency Weighting (Idea 2 or Combined)
+    if cfg.sparsity in ("l1_freq_weighted", "p_annealing_freq"):
+        return FrequencyWeightedLpPenalty(
             n_latents=cfg.n_latents,
             lambda_base=cfg.lambda_base,
+            
+            # Freq params
             ema_beta=cfg.fw_ema_beta,
-            eps=cfg.fw_eps,
+            fw_eps=cfg.fw_eps,
             alpha=cfg.fw_alpha,
             warmup_steps=cfg.fw_warmup_steps,
             clip_min=cfg.fw_clip_min,
             clip_max=cfg.fw_clip_max,
             normalize_mean=cfg.fw_normalize_mean,
+            
+            # P-Annealing params
+            p_start=cfg.p_start,
+            p_end=cfg.p_end,
+            anneal_start=astart,
+            anneal_end=aend,
+            sparsity_eps=cfg.sparsity_eps,
+            
             device=device,
         )
 
@@ -118,7 +99,7 @@ def train(cfg: Config) -> Path:
         ms = _resolve_matryoshka_ms(cfg)
         print(f"[matryoshka] prefix sizes: {ms}")
 
-    # Get d_model by grabbing one forward pass (cheap and robust).
+    # Get d_model by grabbing one forward pass
     toks0 = torch.tensor([[model.tokenizer.bos_token_id] * cfg.seq_len], device=device)
     acts0 = get_activations(model, toks0, hook_name)
     d_model = acts0.shape[-1]
@@ -129,7 +110,7 @@ def train(cfg: Config) -> Path:
         tied_weights=cfg.tied_weights,
         activation=cfg.activation,
         device=device,
-        dtype=torch.float32,  # keep SAE in fp32 for stability
+        dtype=torch.float32,
     )
 
     penalty = _make_penalty(cfg, device=device)
@@ -154,24 +135,13 @@ def train(cfg: Config) -> Path:
     )
     it = iter(batcher)
 
-    stoch_avail = None
-    if cfg.recon_variant == "stoch_avail":
-        stoch_avail = StochasticAvailability(
-            n_latents=cfg.n_latents,
-            p_min=cfg.sa_p_min,
-            gamma=cfg.sa_gamma,
-            inverted=cfg.sa_inverted,
-            shared_across_batch=cfg.sa_shared_across_batch,
-            device=device,
-        )
-
     sae.train()
     pbar = tqdm(total=cfg.num_steps, desc="train", dynamic_ncols=True)
     t0 = time.time()
     tokens_seen = 0
 
     for step in range(1, cfg.num_steps + 1):
-        tokens = next(it)  # [batch, seq]
+        tokens = next(it)
         tokens_seen += int(tokens.numel())
 
         with torch.no_grad():
@@ -179,17 +149,16 @@ def train(cfg: Config) -> Path:
             x = flatten_activations(acts).to(torch.float32)
 
         out = sae(x)
-        a = out.a  # [N, K]
+        a = out.a
 
         # -------------------------
-        # Apply sparsity mechanism to produce activations used for decoding
+        # Sparsity: BatchTopK Gating (Architecture-based)
         # -------------------------
         bt_stats: Dict[str, float] = {}
         if cfg.sparsity == "batchtopk":
-            # Gate *before* any recon-variant masking (availability), since BatchTopK is the primary sparsity.
             a_used, bt_stats = apply_batchtopk(
                 a,
-                k_per_row=float(cfg.target_l0),   # type: ignore[arg-type]
+                k_per_row=float(cfg.target_l0),
                 tie_break=getattr(cfg, "btq_tie_break", "none"),
                 eps=getattr(cfg, "btq_eps", 1e-12),
             )
@@ -197,24 +166,14 @@ def train(cfg: Config) -> Path:
             a_used = a
 
         # -------------------------
-        # Recon path depends on recon_variant
+        # Reconstruction
         # -------------------------
-        sa_stats: Dict[str, float] = {}
-        if cfg.recon_variant == "stoch_avail":
-            assert stoch_avail is not None
-            a_masked, sa_stats = stoch_avail.mask(a_used)
-            x_hat = sae.decode(a_masked)
-            l_recon = recon_loss(x, x_hat, cfg.recon_loss)
-
-        elif cfg.recon_variant == "standard":
+        if cfg.recon_variant == "standard":
             x_hat = sae.decode(a_used) if cfg.sparsity == "batchtopk" else out.x_hat
             l_recon = recon_loss(x, x_hat, cfg.recon_loss)
 
         elif cfg.recon_variant == "matryoshka":
-            # Matryoshka recon = aggregate over multiple prefix reconstructions
             ms = _resolve_matryoshka_ms(cfg)
-
-            # Compute recon loss for each prefix
             recon_terms = []
             for m in ms:
                 x_hat_m = _decode_prefix(sae, a_used, m)
@@ -224,30 +183,25 @@ def train(cfg: Config) -> Path:
                 l_recon = torch.stack(recon_terms).sum()
             else:
                 l_recon = torch.stack(recon_terms).mean()
-
-            # For logging / checkpoint sanity, keep a full reconstruction too
-            # (not used for loss except insofar as full m is likely included in ms)
+            
+            # keep full recon for logging
             x_hat = _decode_prefix(sae, a_used, ms[-1])
 
         else:
             raise ValueError(f"Unknown recon_variant: {cfg.recon_variant}")
 
-        # l_recon = recon_loss(x, x_hat, cfg.recon_loss)
-
         # -------------------------
-        # Sparsity loss term (L1 modes only)
+        # Sparsity Loss (Penalty-based)
         # -------------------------
         if cfg.sparsity == "batchtopk":
             l_sparse = torch.zeros((), device=x.device, dtype=torch.float32)
             sparse_stats: Dict[str, float] = {"lambda_mean": 0.0}
         else:
             assert penalty is not None
-            # For stoch_avail, apply L1 sparsity to the *true* a (ungated/unmasked),
-            # matching your earlier behavior.
+            # Compute Lp / Freq-Weighted penalty
             l_sparse, sparse_stats = penalty.compute(a, step=step)
 
         loss = l_recon + l_sparse
-
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -257,7 +211,7 @@ def train(cfg: Config) -> Path:
 
         opt.step()
 
-        # ---- progress bar update every step ----
+        # ---- Logging ----
         if step == 1 or step % 5 == 0:
             dt = max(time.time() - t0, 1e-6)
             tok_per_s = tokens_seen / dt
@@ -267,18 +221,21 @@ def train(cfg: Config) -> Path:
                 sparse=f"{l_sparse.item():.3e}",
                 tok_s=f"{tok_per_s:.0f}",
             )
+            
+            # Add dynamic p logging
+            if "p_current" in sparse_stats:
+                postfix["p"] = f"{sparse_stats['p_current']:.2f}"
+            
             lam_mean = sparse_stats.get("lambda_mean")
             if "bt_l0_mean" in bt_stats:
                 postfix["bt_l0"] = f"{bt_stats['bt_l0_mean']:.1f}"
             if lam_mean is not None:
                 postfix["lam"] = f"{lam_mean:.2e}"
-            if "sa_mask_mean" in sa_stats:
-                postfix["mask"] = f"{sa_stats['sa_mask_mean']:.2f}"
+                
             pbar.set_postfix(**postfix)
 
         pbar.update(1)
 
-        # ---- logging ----
         if step % cfg.log_every == 0 or step == 1:
             row: Dict[str, float] = {
                 "step": float(step),
@@ -288,17 +245,11 @@ def train(cfg: Config) -> Path:
             }
             row.update({k: float(v) for k, v in bt_stats.items()})
             row.update({k: float(v) for k, v in sparse_stats.items()})
-            row.update({k: float(v) for k, v in sa_stats.items()})
 
             f_metrics.write(json.dumps(row) + "\n")
             f_metrics.flush()
 
             mlflow_log_metrics(cfg, row, step=step)
-
-            print(
-                f"[{step:>6d}] loss={row['loss']:.4e} recon={row['recon']:.4e} sparse={row['sparse']:.4e} "
-                f"lam_mean={row.get('lambda_mean', float('nan')):.3e}"
-            )
 
         if step % cfg.ckpt_every == 0 or step == cfg.num_steps:
             ckpt_path = run_dir / f"sae_step_{step}.pt"
@@ -315,10 +266,11 @@ def train(cfg: Config) -> Path:
     pbar.close()
     f_metrics.close()
 
-    # quick eval snapshot at end
+    # Evaluation phase at end
     sae.eval()
 
-    if cfg.calibrate_l0 and cfg.target_l0 is not None and cfg.sparsity in ("l1_uniform", "l1_freq_weighted"):
+    # If using L1/Lp modes, optionally calibrate lambda for target L0
+    if cfg.calibrate_l0 and cfg.target_l0 is not None and cfg.sparsity != "batchtopk":
         new_lam = calibrate_lambda_for_target_l0(
             cfg, sae,
             model=model,
@@ -329,12 +281,11 @@ def train(cfg: Config) -> Path:
             max_rounds=cfg.calib_rounds,
             tol=cfg.calib_tol,
         )
-        # Update cfg + penalty so subsequent eval uses the calibrated lambda
         cfg = replace(cfg, lambda_base=float(new_lam))
         if penalty is not None and hasattr(penalty, "lambda_base"):
             penalty.lambda_base = float(new_lam)
 
-    # --- BatchTopK inference calibration (global theta) ---
+    # BatchTopK theta calibration
     theta = None
     theta_stats: Dict[str, float] = {}
     if cfg.sparsity == "batchtopk":
@@ -358,10 +309,6 @@ def train(cfg: Config) -> Path:
                 eps=getattr(cfg, "btq_eps", 1e-12),
             )
         )
-        (run_dir / "batchtopk_theta.json").write_text(
-            json.dumps({"theta": theta, **theta_stats}, indent=2, sort_keys=True)
-        )
-        mlflow_log_artifact(cfg, str(run_dir / "batchtopk_theta.json"))
 
     eval_out = run_quick_eval(cfg, sae, model=model, hook_name=hook_name, theta=theta)
     if theta_stats:
@@ -369,13 +316,11 @@ def train(cfg: Config) -> Path:
 
     (run_dir / "eval.json").write_text(json.dumps(eval_out, indent=2, sort_keys=True))
     mlflow_log_metrics(cfg, {f"eval_{k}": float(v) for k, v in eval_out.items()}, step=cfg.num_steps)
-    mlflow_log_artifact(cfg, str(run_dir / "eval.json"))
 
     return run_dir
 
 
 if __name__ == "__main__":
     import tyro
-
     cfg = tyro.cli(Config)
     train(cfg)
