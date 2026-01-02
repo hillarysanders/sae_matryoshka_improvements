@@ -129,7 +129,7 @@ def main() -> None:
             "best_l0_mean": float(best.get("l0_mean", float("nan"))),
             "best_fvu": float(best.get("fvu", float("nan"))),
             "best_avg_max_decoder_cos": float(best.get("avg_max_decoder_cos", float("nan"))),
-            "run_dir": best.get("run_dir", ""),
+            # "run_dir": best.get("run_dir", ""),
         })
 
     print("\n=== Best per method (closest to target_l0; tie-break fvu then cosine) ===")
