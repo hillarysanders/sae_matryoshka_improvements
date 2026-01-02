@@ -10,20 +10,19 @@ LOG_DIR="${LOG_DIR:-${OUT_DIR}/logs}"
 mkdir -p "${LOG_DIR}"
 
 # ---- knobs chosen from your l0_sweep ----
-LAM_L1_UNIFORM="4.8e-5"
-LAM_P_ANNEAL="3.7e-5"
-LAM_FREQ="1.15e-4"
-LAM_COMBINED="1.05e-4"
+LAM_L1_UNIFORM="2.5e-5"
+LAM_P_ANNEAL="2.1e-5"
+LAM_FREQ="3.1e-5"
+LAM_COMBINED="3.1e-5"
 TARGET_L0="40"
 P_END="0.5"
 P_START="1.0"
 
 NUM_STEPS=250
 BATCH_SIZE=16
-SEQ_LEN=128
 EVAL_BATCHES=5
 
-TRAIN_FLAGS="--num_steps ${NUM_STEPS} --batch_size ${BATCH_SIZE} --seq_len ${SEQ_LEN} --eval_num_batches ${EVAL_BATCHES} --ckpt_every ${NUM_STEPS}"
+TRAIN_FLAGS="--num_steps ${NUM_STEPS} --batch_size ${BATCH_SIZE} --eval_num_batches ${EVAL_BATCHES} --ckpt_every ${NUM_STEPS}"
 
 # ---- Job spec format ----
 # name | sparsity | seed | extra_args...
@@ -31,16 +30,20 @@ TRAIN_FLAGS="--num_steps ${NUM_STEPS} --batch_size ${BATCH_SIZE} --seq_len ${SEQ
 # IMPORTANT: keep run_name stable across seeds so plots aggregate.
 # run_name is the first field here.
 JOBS=(
-  "ec2_l1_uniform|l1_uniform|0|--lambda_base ${LAM_L1_UNIFORM}"
-  "ec2_p_anneal|p_annealing|0|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
-  "ec2_freq_l1|l1_freq_weighted|0|--lambda_base ${LAM_FREQ} --fw_warmup_steps 25"
-  "ec2_combined|p_annealing_freq|0|--lambda_base ${LAM_COMBINED} --p_start ${P_START} --p_end ${P_END} --fw_warmup_steps 25"
-  "ec2_batchtopk|batchtopk|0|--target_l0 ${TARGET_L0}"
+  "ec2_l1_uniform|l1_uniform|2|--lambda_base ${LAM_L1_UNIFORM}"
+  "ec2_p_anneal|p_annealing|2|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
+  "ec2_freq_l1|l1_freq_weighted|2|--lambda_base ${LAM_FREQ} --fw_alpha 0.5 --fw_warmup_steps 25"
+  "ec2_combined|p_annealing_freq|2|--lambda_base ${LAM_COMBINED} --p_start ${P_START} --p_end ${P_END} --fw_alpha 0.5 --fw_warmup_steps 25"
+  "ec2_batchtopk|batchtopk|2|--target_l0 ${TARGET_L0}"
 
-  # extra capacity (use for repeats)
-  "ec2_l1_uniform|l1_uniform|1|--lambda_base ${LAM_L1_UNIFORM}"
-  "ec2_p_anneal|p_annealing|1|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
-  "ec2_freq_l1|l1_freq_weighted|1|--lambda_base ${LAM_FREQ} --fw_warmup_steps 25"
+  "ec2_batchtopk|batchtopk|0|--target_l0 ${TARGET_L0} --batch_size 4"
+  "ec2_batchtopk|batchtopk|1|--target_l0 ${TARGET_L0} --batch_size 4"
+  "ec2_batchtopk|batchtopk|2|--target_l0 ${TARGET_L0} --batch_size 4"
+
+#   # extra capacity (use for repeats)
+#   "ec2_l1_uniform|l1_uniform|2|--lambda_base ${LAM_L1_UNIFORM}"
+#   "ec2_p_anneal|p_annealing|2|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
+#   "ec2_freq_l1|l1_freq_weighted|2|--lambda_base ${LAM_FREQ} --fw_warmup_steps 25"
 )
 
 # Optional: pin device/dtype explicitly for EC2 GPU runs
@@ -77,8 +80,11 @@ for gpu in $(seq 0 7); do
 
   cmd=$(cat <<EOF
 cd "$(pwd)" && \
+source ../venv/bin/activate && \
 export CUDA_VISIBLE_DEVICES=${gpu} && \
 export TOKENIZERS_PARALLELISM=false && \
+export HF_HUB_ETAG_TIMEOUT=60 && \
+export HF_HUB_DOWNLOAD_TIMEOUT=60 && \
 echo "[start] gpu=${gpu} run_name=${RUN_NAME} sparsity=${SPARSITY} seed=${SEED} $(date)" && \
 python3 train.py \
   --run_name "${RUN_NAME}" \
@@ -94,6 +100,7 @@ EOF
 
 # send to window gpuN
 tmux send-keys -t "${SESSION}:gpu${gpu}" "${cmd}" C-m
+sleep 5
 done
 
 echo "Launched ${#JOBS[@]} jobs in tmux session ${SESSION}"

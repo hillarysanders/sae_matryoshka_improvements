@@ -36,7 +36,7 @@ run() {
 # for lam in 4e-5 4.3e-5; do
 # for lam in 4.7e-5 5.2e-5; do
 # for lam in 2e-5 2.3e-5; do
-for lam in 2.1e-5 2.4e-5; do
+# for lam in 2.1e-5 2.4e-5; do
 #   echo "=== l1_uniform lam=${lam} ==="
 #   run python3 train.py \
 #     --run_name "ec2_l1u_renorm_lam_${lam}" \
@@ -44,45 +44,57 @@ for lam in 2.1e-5 2.4e-5; do
 #     --lambda_base "${lam}" \
 #     --p_start 1.0 --p_end 1.0 \
 #     "${COMMON_ARGS[@]}"
-  echo "=== p_annealing lam=${lam} ==="
-  run python3 train.py \
-    --run_name "ec2_p_anneal_renorm_lam_${lam}" \
-    --sparsity p_annealing \
-    --lambda_base "${lam}" \
-    --p_start 1.0 --p_end 0.5 \
-    "${COMMON_ARGS[@]}"
-done
+#   echo "=== p_annealing lam=${lam} ==="
+#   run python3 train.py \
+#     --run_name "ec2_p_anneal_renorm_lam_${lam}" \
+#     --sparsity p_annealing \
+#     --lambda_base "${lam}" \
+#     --p_start 1.0 --p_end 0.5 \
+#     "${COMMON_ARGS[@]}"
+# done
 
-# for lam in 1e-6; do
-# for lam in 3e-6; do
-# for lam in 5e-6; do
-# for lam in 6e-6; do
-# for lam in 7e-6; do
+# for lam in 1e-5; do
+# for lam in 1.1e-5; do
+# for lam in 1.2e-5; do
+# for lam in 1.3e-5; do
+# for lam in 2.5e-5; do
+# for lam in 2.6e-5; do
+# for lam in 2.7e-5; do
+# for lam in 2.8e-5; do
+# for lam in 2.9e-5; do
+# for lam in 3e-5; do
+for lam in 3.05e-5; do
+# for lam in 3.1e-5; do
+# for lam in 3.2e-5; do
+# for lam in 4e-5; do
+# for lam in 5e-5; do
+# for lam in 8e-6; do
+# for lam in 9e-6; do
 # for lam in 7.5e-6; do
 # for lam in 6e-5 7e-5; do
 # for lam in 8e-5 9e-5; do
 # for lam in 1e-4 1.1e-4; do
 # for lam in 1.2e-4 1.4e-4; do
-#   echo "=== l1_freq_weighted lam=${lam} ==="
-#   run python3 train.py \
-#     --run_name "ec2_freq_l1_renorm_lam_${lam}" \
-#     --sparsity l1_freq_weighted \
-#     --lambda_base "${lam}" \
-#     --p_start 1.0 --p_end 1.0 \
-#     --fw_alpha 0.5 \
-#     --fw_warmup_steps 25 \
-#     "${COMMON_ARGS[@]}"
+  echo "=== l1_freq_weighted lam=${lam} ==="
+  run python3 train.py \
+    --run_name "ec2_freq_l1_renorm_lam_${lam}" \
+    --sparsity l1_freq_weighted \
+    --lambda_base "${lam}" \
+    --p_start 1.0 --p_end 1.0 \
+    --fw_alpha 0.5 \
+    --fw_warmup_steps 25 \
+    "${COMMON_ARGS[@]}"
 
-#   echo "=== p_annealing_freq lam=${lam} ==="
-#   run python3 train.py \
-#     --run_name "ec2_combined_renorm_lam_${lam}" \
-#     --sparsity p_annealing_freq \
-#     --lambda_base "${lam}" \
-#     --p_start 1.0 --p_end 0.5 \
-#     --fw_alpha 0.5 \
-#     --fw_warmup_steps 25 \
-#     "${COMMON_ARGS[@]}"
-# done
+  echo "=== p_annealing_freq lam=${lam} ==="
+  run python3 train.py \
+    --run_name "ec2_combined_renorm_lam_${lam}" \
+    --sparsity p_annealing_freq \
+    --lambda_base "${lam}" \
+    --p_start 1.0 --p_end 0.5 \
+    --fw_alpha 0.5 \
+    --fw_warmup_steps 25 \
+    "${COMMON_ARGS[@]}"
+done
 
 # echo "=== batchtopk target_l0=${TARGET_L0} ==="
 # run python3 train.py \
