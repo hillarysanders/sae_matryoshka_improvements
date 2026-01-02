@@ -31,18 +31,19 @@ run() {
 
 
 # for lam in "${LAMBDAS[@]}"; do
-for lam in 2.5e-5 3e-5; do
+# for lam in 2.5e-5 3e-5; do
 # for lam in 3.4e-5 3.7e-5; do
 # for lam in 4e-5 4.3e-5; do
 # for lam in 4.7e-5 5.2e-5; do
-  echo "=== l1_uniform lam=${lam} ==="
-  run python3 train.py \
-    --run_name "ec2_l1u_renorm_lam_${lam}" \
-    --sparsity l1_uniform \
-    --lambda_base "${lam}" \
-    --p_start 1.0 --p_end 1.0 \
-    "${COMMON_ARGS[@]}"
-
+# for lam in 2e-5 2.3e-5; do
+for lam in 2.1e-5 2.4e-5; do
+#   echo "=== l1_uniform lam=${lam} ==="
+#   run python3 train.py \
+#     --run_name "ec2_l1u_renorm_lam_${lam}" \
+#     --sparsity l1_uniform \
+#     --lambda_base "${lam}" \
+#     --p_start 1.0 --p_end 1.0 \
+#     "${COMMON_ARGS[@]}"
   echo "=== p_annealing lam=${lam} ==="
   run python3 train.py \
     --run_name "ec2_p_anneal_renorm_lam_${lam}" \
@@ -52,6 +53,12 @@ for lam in 2.5e-5 3e-5; do
     "${COMMON_ARGS[@]}"
 done
 
+# for lam in 1e-6; do
+# for lam in 3e-6; do
+# for lam in 5e-6; do
+# for lam in 6e-6; do
+# for lam in 7e-6; do
+# for lam in 7.5e-6; do
 # for lam in 6e-5 7e-5; do
 # for lam in 8e-5 9e-5; do
 # for lam in 1e-4 1.1e-4; do

@@ -1,25 +1,10 @@
 {
   "target_l0": 40,
-  "lambdas": [
-    "1e-6",
-    "3e-6",
-    "1e-5",
-    "1.5e-5",
-    "2e-5",
-    "2.5e-5",
-    "3e-5",
-    "5e-5",
-    "1e-4",
-    "2e-4",
-    "5e-4",
-    "1e-3",
-    "2e-3"
-  ],
   "methods": [
-    { "name": "l1_uniform", "run_prefix": "mac_l1u_renorm_lam_" },
-    { "name": "p_annealing", "run_prefix": "mac_p_anneal_renorm_lam_" },
-    { "name": "l1_freq_weighted", "run_prefix": "mac_freq_l1_renorm_lam_" },
-    { "name": "p_annealing_freq", "run_prefix": "mac_combined_renorm_lam_" },
-    { "name": "batchtopk", "run_prefix": "mac_batchtopk_k_", "knob": "target_l0" }
+    { "name": "l1_uniform", "run_prefix": "ec2_l1u_renorm_lam_" },
+    { "name": "p_annealing", "run_prefix": "ec2_p_anneal_renorm_lam_" },
+    { "name": "l1_freq_weighted", "run_prefix": "ec2_freq_l1_renorm_lam_" },
+    { "name": "p_annealing_freq", "run_prefix": "ec2_combined_renorm_lam_" },
+    { "name": "batchtopk", "run_prefix": "ec2_batchtopk_k_", "knob": "target_l0" }
   ]
 }

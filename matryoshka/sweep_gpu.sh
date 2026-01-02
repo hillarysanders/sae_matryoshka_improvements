@@ -18,6 +18,13 @@ TARGET_L0="40"
 P_END="0.5"
 P_START="1.0"
 
+NUM_STEPS=250
+BATCH_SIZE=16
+SEQ_LEN=128
+EVAL_BATCHES=5
+
+TRAIN_FLAGS="--num_steps ${NUM_STEPS} --batch_size ${BATCH_SIZE} --seq_len ${SEQ_LEN} --eval_num_batches ${EVAL_BATCHES} --ckpt_every ${NUM_STEPS}"
+
 # ---- Job spec format ----
 # name | sparsity | seed | extra_args...
 #
@@ -26,14 +33,14 @@ P_START="1.0"
 JOBS=(
   "ec2_l1_uniform|l1_uniform|0|--lambda_base ${LAM_L1_UNIFORM}"
   "ec2_p_anneal|p_annealing|0|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
-  "ec2_freq_l1|l1_freq_weighted|0|--lambda_base ${LAM_FREQ}"
-  "ec2_combined|p_annealing_freq|0|--lambda_base ${LAM_COMBINED} --p_start ${P_START} --p_end ${P_END}"
+  "ec2_freq_l1|l1_freq_weighted|0|--lambda_base ${LAM_FREQ} --fw_warmup_steps 25"
+  "ec2_combined|p_annealing_freq|0|--lambda_base ${LAM_COMBINED} --p_start ${P_START} --p_end ${P_END} --fw_warmup_steps 25"
   "ec2_batchtopk|batchtopk|0|--target_l0 ${TARGET_L0}"
 
   # extra capacity (use for repeats)
   "ec2_l1_uniform|l1_uniform|1|--lambda_base ${LAM_L1_UNIFORM}"
   "ec2_p_anneal|p_annealing|1|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
-  "ec2_freq_l1|l1_freq_weighted|1|--lambda_base ${LAM_FREQ}"
+  "ec2_freq_l1|l1_freq_weighted|1|--lambda_base ${LAM_FREQ} --fw_warmup_steps 25"
 )
 
 # Optional: pin device/dtype explicitly for EC2 GPU runs
@@ -59,6 +66,9 @@ done
 
 # Launch jobs
 for gpu in $(seq 0 7); do
+  if [[ $gpu -ge ${#JOBS[@]} ]]; then
+    continue
+  fi
   job="${JOBS[$gpu]}"
   IFS="|" read -r RUN_NAME SPARSITY SEED EXTRA <<< "${job}"
 
@@ -76,9 +86,15 @@ python3 train.py \
   --seed "${SEED}" \
   --sparsity "${SPARSITY}" \
   ${DEVICE_FLAGS} \
+  ${TRAIN_FLAGS} \
   ${EXTRA} \
   2>&1 | tee "${log_file}"
 EOF
 )
 
-  # send to window gpuN
+# send to window gpuN
+tmux send-keys -t "${SESSION}:gpu${gpu}" "${cmd}" C-m
+done
+
+echo "Launched ${#JOBS[@]} jobs in tmux session ${SESSION}"
+echo "Attach with: tmux attach -t ${SESSION}"
