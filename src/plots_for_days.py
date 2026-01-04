@@ -790,7 +790,7 @@ def plot_train_trajectory(
 
     # ax.set_xlabel("FVU (lower better)")
     # ax.set_ylabel("AvgMax decoder cosine (lower better)")
-    ax.set_title("Variance Unexplained vs Decoder Redundancy\n(bottom left = good)")
+    ax.set_title("Variance Unexplained vs Latent Redundancy\n(bottom left = good)")
     ax.set_xlabel(axis_label("fvu"))
     ax.set_ylabel(axis_label("avg_max_decoder_cos"))
     # ax.set_title("Training trajectory: redundancy vs reconstruction — lower is better")
